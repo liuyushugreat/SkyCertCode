@@ -1,0 +1,216 @@
+"""Render the figures used by the SkyCert paper from ``outputs/metrics.json``.
+
+Outputs:
+    outputs/figs/coverage_vs_threat.pdf    — bar chart of coverage/ECE.
+    outputs/figs/martingale_max.pdf        — log-scale martingale peak.
+    outputs/figs/critical_error.pdf        — critical-error-rate before/after abstain.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+# Embed TrueType (Type 42) fonts so the PDFs pass IEEE PDF eXpress
+# checks (Type 3 bitmap fonts are rejected).
+matplotlib.rcParams["pdf.fonttype"] = 42
+matplotlib.rcParams["ps.fonttype"] = 42
+import matplotlib.pyplot as plt
+import numpy as np
+
+from skycert.config import SkyCertConfig
+from skycert.utils import ensure_dir
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Render SkyCert figures")
+    parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="directory to write rendered figures (defaults to <config.output_dir>/figs)",
+    )
+    args = parser.parse_args(argv)
+
+    config = SkyCertConfig.load(args.config)
+    out_dir = Path(config.output_dir)
+    with open(out_dir / "metrics.json", "r", encoding="utf-8") as fh:
+        metrics = json.load(fh)
+    runs = metrics["runs"]
+    figs = ensure_dir(
+        Path(args.output_dir) if args.output_dir is not None else out_dir / "figs"
+    )
+
+    names = [r["threat"]["name"] for r in runs]
+    coverage = [r["coverage"] for r in runs]
+    ece = [r["ece"] for r in runs]
+    mart = [r["martingale_max"] for r in runs]
+    crit_before = [r["critical_error_rate_base"] for r in runs]
+    crit_after = [r["critical_error_rate_after_abstain"] for r in runs]
+    abstain = [r["abstain_rate"] for r in runs]
+
+    # Figure 1: coverage and ECE per threat.
+    fig, ax1 = plt.subplots(figsize=(6.5, 3.4))
+    x = np.arange(len(names))
+    width = 0.35
+    ax1.bar(x - width / 2, coverage, width, label="Coverage",
+            color="#4C72B0")
+    ax1.axhline(1 - config.assurance.conformal.alpha, color="black",
+                linestyle="--", linewidth=0.8, label="Target 1-α")
+    ax1.set_ylim(0.0, 1.35)
+    ax1.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax1.set_ylabel("Empirical coverage")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names, rotation=20, ha="right")
+    ax2 = ax1.twinx()
+    ax2.bar(x + width / 2, ece, width, label="ECE", color="#DD8452")
+    ece_max = max(ece) if ece else 0.2
+    ax2.set_ylim(0.0, max(1.0, ece_max * 5.0))
+    ax2.set_ylabel("Expected Calibration Error")
+    # Combine both axes' handles into a single legend placed in the
+    # reserved headroom above the bars so it never overlaps them.
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper center",
+               bbox_to_anchor=(0.5, 1.00), ncol=3, frameon=False,
+               handlelength=1.6, columnspacing=1.2)
+    fig.tight_layout()
+    fig.savefig(figs / "coverage_vs_threat.pdf")
+    plt.close(fig)
+
+    # Figure 2: martingale peak (log-scale).
+    fig, ax = plt.subplots(figsize=(6.5, 3.0))
+    ax.bar(x, mart, color="#55A868")
+    ax.set_yscale("log")
+    ax.axhline(config.assurance.martingale.threshold, color="red",
+               linestyle="--", linewidth=0.8, label="Alert threshold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha="right")
+    ax.set_ylabel("Max martingale value (log)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(figs / "martingale_max.pdf")
+    plt.close(fig)
+
+    # Figure 3: critical error rate before/after abstention + abstain rate.
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    ax.bar(x - width / 2, crit_before, width, label="Critical error (no abstain)",
+           color="#C44E52")
+    ax.bar(x + width / 2, crit_after, width, label="Critical error (after abstain)",
+           color="#8172B2")
+    # Position each "abstain=..." label just above the taller of the two
+    # bars for that scenario so it never overlaps either bar.
+    for xi, a, cb, ca in zip(x, abstain, crit_before, crit_after):
+        y_top = max(cb, ca) + 0.015
+        ax.text(xi, y_top, f"abstain={a:.2f}",
+                ha="center", va="bottom", fontsize=8, rotation=0)
+    # Reserve vertical headroom so the legend (placed above the data
+    # area) does not overlap any bar or "abstain=..." annotation.
+    y_upper = max(max(crit_before), max(crit_after)) + 0.05
+    ax.set_ylim(0.0, y_upper * 1.55)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha="right")
+    ax.set_ylabel("Critical-class miss rate")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.00), ncol=2,
+              frameon=False, handlelength=1.6, columnspacing=1.2)
+    fig.tight_layout()
+    fig.savefig(figs / "critical_error.pdf")
+    plt.close(fig)
+
+    # Figure 4: Pareto curve (abstain rate vs critical error) if baselines.json exists.
+    baseline_path = out_dir / "baselines.json"
+    if baseline_path.exists():
+        with open(baseline_path, "r", encoding="utf-8") as fh:
+            bl = json.load(fh)
+        pareto = bl["pareto"]
+        fig, ax = plt.subplots(figsize=(5.0, 3.5))
+        for key, label, color, marker in [
+            ("msp", "MSP threshold", "#C44E52", "v"),
+            ("entropy", "Entropy threshold", "#DD8452", "^"),
+            ("skycert", "SkyCert (sweep γ)", "#4C72B0", "o"),
+        ]:
+            pts = pareto.get(key, [])
+            if not pts:
+                continue
+            xs = [p["abstain_rate"] for p in pts]
+            ys = [p["critical_error_after_abstain"] for p in pts]
+            ax.plot(xs, ys, marker=marker, markersize=4, label=label,
+                    color=color, linewidth=1.2, alpha=0.85)
+        bl_items = bl["baselines"]
+        for item in bl_items:
+            if item["method"] == "full SkyCert":
+                ax.plot(item["abstain_rate"],
+                        item["critical_error_rate_after_abstain"],
+                        marker="*", markersize=12, color="#4C72B0",
+                        zorder=5)
+        ax.set_xlabel("Abstention rate")
+        ax.set_ylabel("Critical-class miss rate (after abstention)")
+        ax.legend(fontsize=8)
+        ax.set_xlim(-0.02, 1.0)
+        ax.set_ylim(0.0, None)
+        fig.tight_layout()
+        fig.savefig(figs / "pareto_abstention.pdf")
+        plt.close(fig)
+
+    # Figure 5: lambda_drift sweep and beta4 attack-strength sweep, if
+    # extensions.json is present.
+    ext_path = out_dir / "extensions.json"
+    if ext_path.exists():
+        with open(ext_path, "r", encoding="utf-8") as fh:
+            ext = json.load(fh)
+
+        # Lambda sweep.
+        lam_runs = ext.get("lambda_sweep", [])
+        if lam_runs:
+            fig, ax = plt.subplots(figsize=(5.0, 3.0))
+            lams = [r["lambda_drift"] for r in lam_runs]
+            crit = [r["critical_error_rate_after_abstain"] for r in lam_runs]
+            abst = [r["abstain_rate"] for r in lam_runs]
+            ax.plot(lams, crit, marker="o", color="#4C72B0",
+                    label="Critical miss (after abstention)")
+            ax.plot(lams, abst, marker="s", color="#8172B2",
+                    label="Abstention rate", alpha=0.8)
+            ax.set_xlabel(r"$\lambda_{\mathrm{drift}}$")
+            ax.set_ylabel("Rate")
+            ax.legend(fontsize=8, loc="best")
+            ax.set_ylim(0.0, None)
+            fig.tight_layout()
+            fig.savefig(figs / "lambda_sweep.pdf")
+            plt.close(fig)
+
+        # Attack-strength sweeps.
+        sweep = ext.get("attack_strength_sweep", {})
+        if sweep:
+            fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.0))
+            for ax, key, xlabel in [
+                (axes[0], "beta3", r"$\beta_3$ (feature attack $\ell_\infty$)"),
+                (axes[1], "beta4", r"$\beta_4$ (covariate shift strength)"),
+            ]:
+                runs = sweep.get(key, [])
+                xs = [r["strength"] for r in runs]
+                base = [r["critical_error_rate_base"] for r in runs]
+                after = [r["critical_error_rate_after_abstain"] for r in runs]
+                abst = [r["abstain_rate"] for r in runs]
+                ax.plot(xs, base, marker="o", color="#C44E52",
+                        label="Critical miss (no abstain)")
+                ax.plot(xs, after, marker="s", color="#8172B2",
+                        label="Critical miss (after abstain)")
+                ax.plot(xs, abst, marker="^", color="#4C72B0",
+                        linestyle=":", label="Abstain rate", alpha=0.8)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("Rate")
+                ax.set_ylim(0.0, None)
+                ax.legend(fontsize=7, loc="best")
+            fig.tight_layout()
+            fig.savefig(figs / "attack_strength_sweep.pdf")
+            plt.close(fig)
+
+    print(f"[SkyCert] wrote figures under {figs}")
+
+
+if __name__ == "__main__":
+    main()
