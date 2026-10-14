@@ -12,9 +12,16 @@ Two nonconformity scores are supported:
 Given a calibration set ``(X_cal, y_cal)`` and miscoverage level
 ``alpha``, ``ConformalRiskSet`` computes the empirical
 ``(1 - alpha)(1 + 1/n)``-quantile of calibration scores and, at test
-time, returns the prediction set
+time, returns the *top-1 augmented* prediction set
 
-    C(x) = { y : s(x, y) <= q_hat }.
+    C(x) = { y : s(x, y) <= q_hat }  union  { argmax_k p_k(x) }.
+
+The raw APS set can be empty when the top-ranked class alone already has
+cumulative mass above ``q_hat``; the union with the top-1 label makes the
+set non-empty by construction.  Because the augmented set is a superset
+of the raw set, the marginal coverage guarantee is preserved (coverage
+can only increase), at the cost of a slightly larger average set size.
+Set ``include_top1=False`` to obtain the raw APS/LAC set.
 """
 
 from __future__ import annotations
@@ -23,11 +30,17 @@ import numpy as np
 
 
 class ConformalRiskSet:
-    def __init__(self, alpha: float = 0.1, score: str = "aps") -> None:
+    def __init__(
+        self,
+        alpha: float = 0.1,
+        score: str = "aps",
+        include_top1: bool = True,
+    ) -> None:
         if score not in {"aps", "lac"}:
             raise ValueError(f"unknown score {score!r}")
         self.alpha = float(alpha)
         self.score = score
+        self.include_top1 = bool(include_top1)
         self.q_hat: float | None = None
         self.num_classes: int | None = None
 
@@ -83,10 +96,23 @@ class ConformalRiskSet:
         else:
             class_scores = 1.0 - probs
         mask = class_scores <= self.q_hat
-        # Guard: always include the top-1 label so we never emit an empty set.
-        top1 = np.argmax(probs, axis=1)
-        mask[np.arange(mask.shape[0]), top1] = True
+        if self.include_top1:
+            # Top-1 augmentation: C(x) := C_raw(x) U {argmax p}. Makes the
+            # set non-empty by construction and only enlarges it, so the
+            # marginal coverage guarantee of the raw set is preserved.
+            top1 = np.argmax(probs, axis=1)
+            mask[np.arange(mask.shape[0]), top1] = True
         return mask
+
+    def raw_empty_rate(self, probs: np.ndarray) -> float:
+        """Fraction of inputs whose *raw* (un-augmented) set would be empty."""
+        if self.q_hat is None:
+            raise RuntimeError("ConformalRiskSet.calibrate must be called first")
+        if self.score == "aps":
+            class_scores = self._aps_class_scores(probs)
+        else:
+            class_scores = 1.0 - probs
+        return float((~(class_scores <= self.q_hat)).all(axis=1).mean())
 
     def coverage(self, probs: np.ndarray, labels: np.ndarray) -> float:
         mask = self.predict_sets(probs)
@@ -95,3 +121,46 @@ class ConformalRiskSet:
     def average_set_size(self, probs: np.ndarray) -> float:
         mask = self.predict_sets(probs)
         return float(mask.sum(axis=1).mean())
+
+
+def sequestered_coverage_check(
+    probs_val: np.ndarray,
+    labels_val: np.ndarray,
+    conformal: "ConformalRiskSet",
+    *,
+    z: float = 2.33,
+    critical_class: int | None = None,
+) -> dict:
+    """Post-hoc calibration-integrity test on a sequestered validation split.
+
+    Under an intact calibration set, empirical coverage on an independent
+    exchangeable split concentrates around ``1 - alpha``; a poisoned
+    calibration set that shrinks ``q_hat`` shows up as coverage below
+    ``1 - alpha - z * sqrt(alpha (1 - alpha) / n_val)`` (one-sided normal
+    bound; ``z = 2.33`` is the 99% point).  The same test is applied to
+    the class-conditional coverage of ``critical_class`` when given.
+    """
+    n = int(labels_val.shape[0])
+    alpha = conformal.alpha
+    mask = conformal.predict_sets(probs_val)
+    cov = float(mask[np.arange(n), labels_val].mean())
+    tol = z * float(np.sqrt(alpha * (1.0 - alpha) / max(n, 1)))
+    flagged = cov < (1.0 - alpha - tol)
+    out = {
+        "n_val": n,
+        "coverage": cov,
+        "lower_bound": 1.0 - alpha - tol,
+        "flagged": bool(flagged),
+    }
+    if critical_class is not None:
+        sel = labels_val == critical_class
+        if sel.any():
+            n_c = int(sel.sum())
+            cov_c = float(mask[np.arange(n)[sel], critical_class].mean())
+            tol_c = z * float(np.sqrt(alpha * (1.0 - alpha) / n_c))
+            out["critical_n"] = n_c
+            out["critical_coverage"] = cov_c
+            out["critical_lower_bound"] = 1.0 - alpha - tol_c
+            out["critical_flagged"] = bool(cov_c < (1.0 - alpha - tol_c))
+            out["flagged"] = bool(out["flagged"] or out["critical_flagged"])
+    return out

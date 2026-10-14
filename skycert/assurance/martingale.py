@@ -79,12 +79,16 @@ class MartingaleMonitor:
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
 
+    _reference: list[float] = field(default_factory=list)
+    _since_reset: int = 0
+
     def reset(self) -> None:
         self.score_history.clear()
         self.trace.clear()
         self.alert_history.clear()
         self.martingale = 1.0
         self._max_martingale = 1.0
+        self._since_reset = 0
         self._rng = np.random.default_rng(self.seed)
 
     def warm_start(self, reference: np.ndarray) -> None:
@@ -95,7 +99,22 @@ class MartingaleMonitor:
         conformal p-values computed against the pooled history, which
         is the standard *conformal test-martingale* construction.
         """
-        self.score_history = list(map(float, reference.tolist()))
+        self._reference = list(map(float, reference.tolist()))
+        self.score_history = list(self._reference)
+
+    def restart_window(self) -> None:
+        """Start a new monitoring window.
+
+        The martingale is reset to 1 and the pooled history is rolled back
+        to the calibration reference, so the next window is tested against
+        calibration alone.  Ville's inequality then holds *per window*; with
+        ``W`` windows the probability of any benign alert is at most ``W /
+        threshold`` (union bound).  Traces and alert history are kept so
+        that detection delays can still be measured across the stream.
+        """
+        self.score_history = list(self._reference)
+        self.martingale = 1.0
+        self._since_reset = 0
 
     def update(self, score: float) -> dict:
         """Push one nonconformity score and return the current state."""
@@ -115,13 +134,19 @@ class MartingaleMonitor:
         self.trace.append(self.martingale)
         alert = self.martingale >= self.threshold
         self.alert_history.append(alert)
+        self._since_reset += 1
         return {
             "p_value": p,
             "f_p": f_p,
             "martingale": self.martingale,
             "alert": alert,
             "t": t_pre + 1,
+            "window_step": self._since_reset,
         }
+
+    @property
+    def steps_in_window(self) -> int:
+        return self._since_reset
 
     def cumulative_alerts(self) -> int:
         return int(sum(self.alert_history))

@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 
-from .assurance.audit import AuditLogger
+from .assurance.audit import AuditLogger, sha256_of_arrays, sha256_of_json
 from .assurance.conformal import ConformalRiskSet
 from .assurance.martingale import MartingaleMonitor, SimpleJumperBetting
 from .assurance.policy import AssuranceDecision, AssurancePolicy, DecisionKind
@@ -35,6 +35,8 @@ class _CalibrationState:
     alpha: float
     score: str
     reference_scores: np.ndarray  # label-free nonconformity on the calib set
+    calib_sha256: str = ""
+    rules_sha256: str = ""
 
 
 class SkyCertPipeline:
@@ -90,12 +92,54 @@ class SkyCertPipeline:
             [self._nonconformity(X_calib[i], probs[i]) for i in range(X_calib.shape[0])]
         )
         self.monitor.warm_start(ref)
+        calib_sha = sha256_of_arrays(X_calib, y_calib)
+        rules_sha = sha256_of_json(
+            [r.__dict__ for r in self.reasoner.symbolic.rules]
+        )
         self._calibrated = _CalibrationState(
             q_hat=q_hat,
             alpha=self.conformal.alpha,
             score=self.conformal.score,
             reference_scores=ref,
+            calib_sha256=calib_sha,
+            rules_sha256=rules_sha,
         )
+        if self._logger is not None:
+            self._logger.write_header(self.calibration_header())
+
+    def calibration_header(self) -> dict:
+        """Calibration-pinning metadata (first line of every audit log)."""
+        if self._calibrated is None:
+            raise RuntimeError("SkyCertPipeline.calibrate must be called first")
+        c = self.config.assurance
+        st = self._calibrated
+        return {
+            "q_hat": st.q_hat,
+            "alpha": st.alpha,
+            "conformal_score": st.score,
+            "num_classes": self.num_classes,
+            "n_calib": int(st.reference_scores.shape[0]),
+            "calib_sha256": st.calib_sha256,
+            "rules_sha256": st.rules_sha256,
+            "martingale": {
+                "epsilon": c.martingale.epsilon,
+                "threshold": c.martingale.threshold,
+                "lambda_drift": float(
+                    getattr(c.martingale, "lambda_drift", 1.0)
+                ),
+                "drift_mode": str(getattr(c.martingale, "drift_mode", "rms")),
+                "hinge_z": float(getattr(c.martingale, "hinge_z", 2.0)),
+                "reset_every": int(getattr(c.martingale, "reset_every", 0) or 0),
+                "drift_features": (
+                    [int(i) for i in c.martingale.drift_features]
+                    if getattr(c.martingale, "drift_features", None) else None
+                ),
+            },
+            "policy": {
+                "max_set_fraction": c.policy.max_set_fraction,
+                "escalate_on_martingale": c.policy.escalate_on_martingale,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Inference API
@@ -126,9 +170,22 @@ class SkyCertPipeline:
         conf = float(1.0 - probs_row.max())
         if self._feature_mean is None or self._feature_scale is None:
             return conf
+        mc = self.config.assurance.martingale
         z = (x - self._feature_mean) / self._feature_scale
+        feats = getattr(mc, "drift_features", None)
+        if feats:
+            # Restrict the drift term to the monitored (attack-surface)
+            # features; slowly varying exogenous context that is not an
+            # attack surface can be excluded to avoid harmless-shift alarms.
+            z = z[np.asarray(feats, dtype=int)]
+        mode = str(getattr(mc, "drift_mode", "rms"))
+        if mode == "hinge":
+            # Tolerance band: only deviations beyond +-hinge_z calibration
+            # standard deviations count as drift. Still a deterministic
+            # function of (x, p), hence a valid nonconformity score.
+            z = np.maximum(np.abs(z) - float(getattr(mc, "hinge_z", 2.0)), 0.0)
         drift = float(np.sqrt(np.mean(z * z)))
-        lam = float(getattr(self.config.assurance.martingale, "lambda_drift", 1.0))
+        lam = float(getattr(mc, "lambda_drift", 1.0))
         return conf + lam * drift
 
     def step(
@@ -141,7 +198,11 @@ class SkyCertPipeline:
         x2 = x.reshape(1, -1)
         probs = self.reasoner.predict_proba(x2)[0]
         set_mask = self.conformal.predict_sets(probs.reshape(1, -1))[0]
-        update = self.monitor.update(self._nonconformity(x, probs))
+        score = self._nonconformity(x, probs)
+        reset_every = int(getattr(self.config.assurance.martingale, "reset_every", 0) or 0)
+        if reset_every > 0 and self.monitor.steps_in_window >= reset_every:
+            self.monitor.restart_window()
+        update = self.monitor.update(score)
         decision = self.policy.decide(
             probs_row=probs,
             set_mask=set_mask,
@@ -155,7 +216,12 @@ class SkyCertPipeline:
                 sample_id=sample_id if sample_id is not None else "n/a",
                 probs=probs.tolist(),
                 rule_trace=trace,
-                extra={"p_value": update["p_value"], "t": update["t"]},
+                extra={
+                    "p_value": update["p_value"],
+                    "t": update["t"],
+                    "nonconformity": float(score),
+                    "q_hat": self._calibrated.q_hat,
+                },
             )
         return decision
 

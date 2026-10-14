@@ -36,6 +36,62 @@ def corrupt_rules(
     return corrupted
 
 
+def rank_rules_by_critical_impact(
+    rules: Sequence[SymbolicRule],
+    reasoner_factory,
+    X_ref: np.ndarray,
+    critical_class: int = 3,
+) -> list[dict]:
+    """Rank rules by how strongly flipping each one alone suppresses
+    CRITICAL-class decisions on a reference sample.
+
+    ``reasoner_factory(rules) -> object with predict(X)`` builds a reasoner
+    around an arbitrary rule set.  The impact of rule ``i`` is the net
+    number of reference operations whose arg-max moves *away from*
+    CRITICAL when only ``delta_i`` is negated (an attacker wants fewer
+    CRITICAL labels), normalised by ``len(X_ref)``.  Ties are broken by the
+    magnitude of the rule's CRITICAL-class delta.
+    """
+    base_pred = reasoner_factory(list(rules)).predict(X_ref)
+    base_crit = base_pred == critical_class
+    ranked: list[dict] = []
+    for i, r in enumerate(rules):
+        flipped = [copy.deepcopy(rr) for rr in rules]
+        flipped[i] = replace(r, delta=[-d for d in r.delta])
+        pred = reasoner_factory(flipped).predict(X_ref)
+        lost = int(np.sum(base_crit & (pred != critical_class)))
+        gained = int(np.sum(~base_crit & (pred == critical_class)))
+        ranked.append({
+            "rule_id": i,
+            "feature": r.feature,
+            "impact": (lost - gained) / max(len(X_ref), 1),
+            "critical_delta": float(r.delta[critical_class]),
+        })
+    ranked.sort(key=lambda d: (-d["impact"], -abs(d["critical_delta"])))
+    return ranked
+
+
+def corrupt_rules_targeted(
+    rules: Sequence[SymbolicRule],
+    k: int,
+    ranking: Sequence[dict],
+) -> list[SymbolicRule]:
+    """Negate exactly the ``k`` highest-impact rule deltas (targeted T1).
+
+    Unlike :func:`corrupt_rules`, which flips each rule independently with
+    probability ``strength`` (expected footprint ``strength * m``), this is
+    a minimal-footprint attacker who chooses *which* rules to invert.
+    """
+    victims = {int(d["rule_id"]) for d in list(ranking)[: int(k)]}
+    out: list[SymbolicRule] = []
+    for i, r in enumerate(rules):
+        if i in victims:
+            out.append(replace(r, delta=[-d for d in r.delta]))
+        else:
+            out.append(copy.deepcopy(r))
+    return out
+
+
 def inject_rule_noise(
     rules: Sequence[SymbolicRule],
     strength: float,
@@ -66,6 +122,84 @@ def perturb_features(
     """Untargeted L-inf bounded perturbation used for sensor-spoof simulation."""
     noise = rng.uniform(-strength, strength, size=X.shape)
     return np.clip(X + noise, 0.0, 1.0)
+
+
+def adaptive_feature_attack(
+    X: np.ndarray,
+    mode: str,
+    strength: float,
+    rng: np.random.Generator,
+    *,
+    y_true: np.ndarray | None = None,
+    critical_class: int = 3,
+    duty_cycle: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """SkyCert-aware (adaptive) variants of the T3 feature attack.
+
+    Returns ``(X_adv, attacked_mask)``.  Modes:
+
+    * ``persistent_sub`` -- constant radius ``strength`` (meant to be used
+      below the martingale's empirical sensitivity band, e.g. 0.08).
+    * ``ramp`` -- radius grows linearly from 0 to ``strength`` across the
+      attacked window, so the stream drifts slowly instead of jumping.
+    * ``intermittent`` -- radius ``strength`` applied only to a random
+      ``duty_cycle`` fraction of operations, interleaved with clean ones.
+    * ``critical_directed`` -- perturbs *only* truly CRITICAL operations
+      (requires ``y_true``; a strong attacker with ground-truth knowledge)
+      and pushes the five safety features toward the benign regime
+      (lower weather/density/congestion/noise, higher battery) by exactly
+      ``strength``; all other operations are left untouched so the
+      population-level input distribution barely moves.
+    """
+    X_adv = X.copy()
+    n, d = X.shape
+    if mode == "persistent_sub":
+        noise = rng.uniform(-strength, strength, size=X.shape)
+        X_adv = X + noise
+        mask = np.ones(n, dtype=bool)
+    elif mode == "ramp":
+        radii = np.linspace(0.0, strength, n)[:, None]
+        noise = rng.uniform(-1.0, 1.0, size=X.shape) * radii
+        X_adv = X + noise
+        mask = np.ones(n, dtype=bool)
+    elif mode == "intermittent":
+        mask = rng.random(n) < duty_cycle
+        noise = rng.uniform(-strength, strength, size=X.shape)
+        X_adv[mask] = X[mask] + noise[mask]
+    elif mode == "critical_directed":
+        if y_true is None:
+            raise ValueError("critical_directed requires y_true")
+        mask = y_true == critical_class
+        direction = np.zeros(d)
+        direction[:5] = np.array([-1.0, -1.0, -1.0, +1.0, -1.0])
+        X_adv[mask] = X[mask] + strength * direction[None, :]
+    else:
+        raise ValueError(f"unknown adaptive mode {mode!r}")
+    return np.clip(X_adv, 0.0, 1.0), mask
+
+
+def poison_calibration_labels(
+    y_calib: np.ndarray,
+    preds_calib: np.ndarray,
+    fraction: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calibration-set *agreement laundering*.
+
+    A fraction of calibration labels is overwritten with the reasoner's own
+    top-1 prediction.  Every laundered sample then has a minimal
+    nonconformity score, so the conformal quantile ``q_hat`` shrinks and
+    the deployed sets silently under-cover.  Returns ``(y_poisoned, mask)``.
+    """
+    n = y_calib.shape[0]
+    disagree = np.flatnonzero(preds_calib != y_calib)
+    k = int(round(fraction * n))
+    chosen = rng.choice(disagree, size=min(k, disagree.size), replace=False)
+    y_p = y_calib.copy()
+    y_p[chosen] = preds_calib[chosen]
+    mask = np.zeros(n, dtype=bool)
+    mask[chosen] = True
+    return y_p, mask
 
 
 def shift_covariates(

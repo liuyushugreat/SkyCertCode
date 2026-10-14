@@ -38,6 +38,11 @@ assurance:
     type: simple_jumper    # {simple_jumper, power}
     epsilon: 0.92
     threshold: 20.0        # raise ALERT when martingale exceeds this
+    lambda_drift: 1.0      # weight of the label-free drift term (Eq. hybrid score)
+    drift_mode: rms        # {rms, hinge}; hinge ignores |z| < hinge_z
+    hinge_z: 2.0
+    reset_every: 0         # >0: restart the martingale every N operations (windowed monitor)
+    drift_features: null   # optional feature subset for the drift term (attack surface only)
   policy:
     # Abstain when prediction set is larger than this fraction of classes.
     max_set_fraction: 0.75

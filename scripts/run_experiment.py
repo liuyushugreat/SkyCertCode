@@ -184,6 +184,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     _CALIB_CACHE["X"] = data.X_calib
     _CALIB_CACHE["y"] = data.y_calib
+    # Persist the calibration snapshot next to the audit logs so that
+    # ``scripts.replay_audit --calib-npz`` can verify the header pin.
+    np.savez_compressed(
+        audit_dir / "calibration.npz", X_calib=data.X_calib, y_calib=data.y_calib
+    )
 
     neural = NeuralRiskScorer(
         num_classes=data.num_classes,

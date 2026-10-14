@@ -64,6 +64,28 @@ class MartingaleConfig:
     # score. lambda_drift = 1.0 reproduces the default equal-weight design;
     # the lambda-sweep experiment varies it in {0.3, 0.5, 1.0, 2.0, 3.0}.
     lambda_drift: float = 1.0
+    # How the per-feature standardised deviations z_j are aggregated into
+    # the input-drift term:
+    #   "rms"   -> sqrt(mean_j z_j^2)                      (paper default)
+    #   "hinge" -> sqrt(mean_j max(0, |z_j| - hinge_z)^2)  (tolerance band:
+    #             deviations inside +-hinge_z sigma of the calibration
+    #             envelope do not count as drift; used in the operational
+    #             case study to ignore benign day-to-day variability)
+    drift_mode: str = "rms"
+    hinge_z: float = 2.0
+    # Windowed monitoring: restart the martingale (against the calibration
+    # reference) every ``reset_every`` operations.  ``0`` disables windowing
+    # (paper default: a single anytime-valid martingale over the stream).
+    # With windows, raise ``threshold`` so that (#windows per shift) /
+    # threshold stays within the desired false-alarm budget.
+    reset_every: int = 0
+    # Feature indices over which the input-drift term is computed.  ``None``
+    # (paper default) uses all features.  In the operational case study the
+    # term is restricted to the attack-surface features (surveillance and
+    # telemetry derived); slowly varying exogenous context from certified
+    # sources (temperature, humidity, precipitation, ...) is excluded so
+    # that benign day-to-day weather does not raise harmless-shift alarms.
+    drift_features: list[int] | None = None
 
 
 @dataclass
